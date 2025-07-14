@@ -587,14 +587,44 @@ class v8PoseLoss(v8DetectionLoss):
         return kpts_loss, kpts_obj_loss
 
 
+class LabelSmoothingLoss(nn.Module):
+    def __init__(self, classes, smoothing=0.1, dim=-1):
+        super(LabelSmoothingLoss, self).__init__()
+        self.confidence = 1.0 - smoothing
+        self.smoothing = smoothing
+        self.cls = classes
+        self.dim = dim
+        self.kl = nn.KLDivLoss(reduction="batchmean")
+
+    def forward(self, pred, target):
+        pred = pred.log_softmax(dim=self.dim)  # KL需要log_softmax
+        with torch.no_grad():
+            true_dist = torch.zeros_like(pred)
+            true_dist.fill_(self.smoothing / (self.cls - 1))
+            true_dist.scatter_(1, target.unsqueeze(1), self.confidence)
+        return self.kl(pred, true_dist)
+
+
+
 class v8ClassificationLoss:
-    """Criterion class for computing training losses."""
+    """用于 YOLOv8 分类任务的复合损失函数：交叉熵 + 标签平滑"""
+
+    def __init__(self, num_classes=4, smoothing=0.1, alpha=0.5):
+        """
+        :param num_classes: 类别数（与你任务匹配）
+        :param smoothing: 标签平滑因子
+        :param alpha: 两种损失的加权比例（越大越偏向交叉熵）
+        """
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.ls_loss = LabelSmoothingLoss(classes=num_classes, smoothing=smoothing)
+        self.alpha = alpha  # alpha=1.0 → 完全用CE，alpha=0.0 → 完全用LS
 
     def __call__(self, preds, batch):
-        """Compute the classification loss between predictions and true labels."""
-        loss = torch.nn.functional.cross_entropy(preds, batch["cls"], reduction="mean")
-        loss_items = loss.detach()
-        return loss, loss_items
+        ce = self.ce_loss(preds, batch["cls"])
+        ls = self.ls_loss(preds, batch["cls"])
+        total = self.alpha * ce + (1 - self.alpha) * ls
+        #total = ce
+        return total, total.detach()
 
 
 class v8OBBLoss(v8DetectionLoss):

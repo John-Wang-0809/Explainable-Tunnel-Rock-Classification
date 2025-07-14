@@ -2,7 +2,7 @@
 # YOLOv8-cls image classification model. For Usage examples see https://docs.ultralytics.com/tasks/classify
 
 # Parameters
-nc: 1000 # number of classes
+nc: 4 # number of classes
 scales: # model compound scaling constants, i.e. 'model=yolov8n-cls.yaml' will call yolov8-cls.yaml with scale 'n'
   # [depth, width, max_channels]
   n: [0.33, 0.25, 1024]
@@ -18,8 +18,10 @@ backbone:
   - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
   - [-1, 3, C2f, [128, True]]
   - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 1, SoftTokenShiftBlock, [256]]
   - [-1, 6, C2f, [256, True]]
   - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 1, SoftTokenShiftBlock, [512]]
   - [-1, 6, C2f, [512, True]]
   - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
   - [-1, 3, C2f, [1024, True]]

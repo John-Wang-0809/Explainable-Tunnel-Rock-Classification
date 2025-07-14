@@ -2,7 +2,7 @@
 
 from ultralytics.utils import SETTINGS, TESTS_RUNNING
 from ultralytics.utils.torch_utils import model_info_for_loggers
-
+import os
 try:
     assert not TESTS_RUNNING  # do not log pytest
     assert SETTINGS["wandb"] is True  # verify integration is enabled
@@ -109,7 +109,7 @@ def _log_plots(plots, step):
 
 def on_pretrain_routine_start(trainer):
     """Initiate and start project if module is present."""
-    wb.run or wb.init(project=trainer.args.project or "YOLOv8", name=trainer.args.name, config=vars(trainer.args))
+    wb.run or wb.init(project=os.path.basename(trainer.args.project) or "YOLOv8", name=trainer.args.name, config=vars(trainer.args))
 
 
 def on_fit_epoch_end(trainer):

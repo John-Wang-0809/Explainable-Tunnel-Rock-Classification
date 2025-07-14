@@ -78,6 +78,7 @@ class BaseDataset(Dataset):
         self.batch_size = batch_size
         self.stride = stride
         self.pad = pad
+        self.hyp = hyp  # Attribute initialization, hyp is a dictionary containing training hyperparameters
         if self.rect:
             assert self.batch_size is not None
             self.set_rectangle()
@@ -143,7 +144,9 @@ class BaseDataset(Dataset):
 
     def load_image(self, i, rect_mode=True):
         """Loads 1 image from dataset index 'i', returns (im, resized hw)."""
-        im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i]
+        #f就是原始可见光图像路径
+        im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i]     # image, file, file with .npy extension
+        ir = f.replace("images", 'image')  # 将可见光图像的images替换为image，即对应的红外图像
         if im is None:  # not cached in RAM
             if fn.exists():  # load npy
                 try:
@@ -154,6 +157,8 @@ class BaseDataset(Dataset):
                     im = cv2.imread(f)  # BGR
             else:  # read image
                 im = cv2.imread(f)  # BGR
+                if self.hyp.ch > 3:  # If input channels (defined in default.yaml) is greater than 3
+                    im = cv2.merge((cv2.imread(ir), im))  # Merge visible and infrared images
             if im is None:
                 raise FileNotFoundError(f"Image Not Found {f}")
 

@@ -2,8 +2,10 @@
 """Block modules."""
 
 import torch
+import math
 import torch.nn as nn
 import torch.nn.functional as F
+from timm.models.layers import DropPath, to_2tuple
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
@@ -46,8 +48,831 @@ __all__ = (
     "Attention",
     "PSA",
     "SCDown",
+    "EFBlock",
+    "Multiin",
+    "IN",
+    "CrossTransformerFusion",
+    "CPCA",
+    "FeatureAdd",
+    "SoftTokenShiftBlock",
+    "FECA",
 )
+##################################Tokenshift#########################################
+class SoftTokenShiftBlock(nn.Module):
+    def __init__(self, channels,channels1):
+        super().__init__()
+        self.depthwise_conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels)
+        self.pointwise_conv = nn.Conv2d(channels, channels, kernel_size=1)
+        self.norm = nn.BatchNorm2d(channels)
+        self.relu = nn.ReLU()
 
+        # Learnable parameters: 4 directional shift weights (non-normalized)
+        self.shift_weights = nn.Parameter(torch.randn(4))  # [↑ ↓ ← →]
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        # Normalize weights (softmax ensures sum equals 1)
+        weights = F.softmax(self.shift_weights, dim=0)
+
+        # Calculate separately for 4 directional shifts
+        shift_up    = torch.roll(x, shifts=-1, dims=2)  # ↑ upward
+        shift_down  = torch.roll(x, shifts=1, dims=2)   # ↓ downward
+        shift_left  = torch.roll(x, shifts=-1, dims=3)  # ← leftward
+        shift_right = torch.roll(x, shifts=1, dims=3)   # → rightward
+
+        # Weighted fusion
+        shifted = (
+            weights[0] * shift_up +
+            weights[1] * shift_down +
+            weights[2] * shift_left +
+            weights[3] * shift_right
+        )
+
+        # Convolution for feature extraction
+        out = self.depthwise_conv(shifted)
+        out = self.relu(self.norm(self.pointwise_conv(out)))
+
+        return out + x  # Residual connection
+
+##################################FECA Attention#########################################
+
+class FECA(nn.Module):
+    def __init__(self, channels, channels1, reduction=16):
+        super(FECA, self).__init__()
+        self.pool_avg = nn.AdaptiveAvgPool2d(1)  # Average Pooling
+        self.pool_max = nn.AdaptiveMaxPool2d(1)  # Max Pooling
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels * 2, channels // reduction, 1),  # Multiply by 2 because concatenating average pooling and max pooling
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # Simple frequency domain perturbation
+        fft_feat = torch.fft.fft2(x, norm='ortho').real
+        avg_pool = self.pool_avg(fft_feat)  # Average pooling
+        max_pool = self.pool_max(fft_feat)  # Max pooling
+        pooled_feat = torch.cat([avg_pool, max_pool], dim=1)  # Concatenate pooling results
+        weight = self.fc(pooled_feat)  # Through fully connected layer
+        return x * weight + x # Residual connection
+
+##################################CPCA Attention#########################################
+
+class FeatureAdd(nn.Module):
+    #  x + CPCA
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        #print(x[0].shape)
+        #print(x[1].shape)
+        return torch.add(x[0], x[1])
+
+
+class CPCA_ChannelAttention(nn.Module):
+
+    def __init__(self, input_channels, internal_neurons):
+        super(CPCA_ChannelAttention, self).__init__()
+        self.fc1 = nn.Conv2d(in_channels=input_channels, out_channels=internal_neurons, kernel_size=1, stride=1,
+                             bias=True)
+        self.fc2 = nn.Conv2d(in_channels=internal_neurons, out_channels=input_channels, kernel_size=1, stride=1,
+                             bias=True)
+        self.input_channels = input_channels
+        self.conv = nn.Conv2d(input_channels, input_channels, kernel_size=(2, 1), stride=1, padding=(0, 0))
+
+    def forward(self, inputs):
+        '''
+
+        Args:
+            inputs:
+
+        Returns:
+
+
+        #print(4)
+        #print(inputs.shape)
+        B, C, H, W = inputs.shape
+        inputs_reshaped = inputs.permute(0, 2, 3, 1).reshape(B, H * W, 1, C)
+        #print(inputs_reshaped.shape)
+        #print(5)
+        x1 = F.adaptive_avg_pool2d(inputs_reshaped, output_size=(1,1))  # Channel pooling at each position
+        #print(x1.shape)
+        x1 = self.fc1(x1)
+        #print(x1.shape)
+        x1 = F.relu(x1, inplace=True)
+        x1 = self.fc2(x1)
+        x1 = torch.sigmoid(x1)
+        x2 = F.adaptive_max_pool2d(inputs_reshaped, output_size=(1,1))  # Channel pooling at each position
+        #print(x2.shape)
+        x2 = self.fc1(x2)
+        #print(x2.shape)
+        x2 = F.relu(x2, inplace=True)
+        x2 = self.fc2(x2)
+        x2 = torch.sigmoid(x2)
+        x = x1 + x2
+        x = x.view(-1, self.input_channels, 1, 1)
+        '''
+       
+        #print(3)
+        #print(inputs.shape)
+        x1 = F.adaptive_avg_pool2d(inputs, output_size=(1, 1))
+        #print(x1.shape)
+        x1 = self.fc1(x1)
+        #print(x1.shape)
+        x1 = F.relu(x1, inplace=True)
+        x1 = self.fc2(x1)
+        #print(x1.shape)
+        x1 = torch.sigmoid(x1)
+        x2 = F.adaptive_max_pool2d(inputs, output_size=(1, 1))
+        x2 = self.fc1(x2)
+        x2 = F.relu(x2, inplace=True)
+        x2 = self.fc2(x2)
+        x2 = torch.sigmoid(x2)
+
+        #x = torch.cat((x1, x2), dim=2)
+        #print(x.shape)
+        #x = self.conv(x)
+        #print(x.shape)
+
+        x = x1 + x2
+        #x = x.view(-1, self.input_channels, 1, 1)
+        #print(x.shape)
+
+        return x
+
+
+class CPCA(nn.Module):
+    def __init__(self, channels, out_channels, input_dim,channelAttention_reduce=8, num_heads=2, num_layers=1, dropout=0.1):
+        super().__init__()
+
+        self.ca = CPCA_ChannelAttention(input_channels=channels//2, internal_neurons=channels // channelAttention_reduce)
+        # Initialize a placeholder, input_dim will be dynamically calculated in forward
+        self.hidden_dim = None
+        self.model_dim = None
+        self.conv = nn.Conv2d(input_dim, input_dim, kernel_size=(2, 1), stride=1, padding=(0, 0))
+        '''
+        self.dconv5_5 = nn.Conv2d(channels, channels, kernel_size=5, padding=2, groups=channels)
+        self.dconv1_7 = nn.Conv2d(channels, channels, kernel_size=(1, 7), padding=(0, 3), groups=channels)
+        self.dconv7_1 = nn.Conv2d(channels, channels, kernel_size=(7, 1), padding=(3, 0), groups=channels)
+        self.dconv1_11 = nn.Conv2d(channels, channels, kernel_size=(1, 11), padding=(0, 5), groups=channels)
+        self.dconv11_1 = nn.Conv2d(channels, channels, kernel_size=(11, 1), padding=(5, 0), groups=channels)
+        self.dconv1_21 = nn.Conv2d(channels, channels, kernel_size=(1, 21), padding=(0, 10), groups=channels)
+        self.dconv21_1 = nn.Conv2d(channels, channels, kernel_size=(21, 1), padding=(10, 0), groups=channels)
+        self.conv2 = nn.Conv2d(channels, out_channels, kernel_size=(1, 1), padding=0)
+        self.act = nn.GELU()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=(1, 1), padding=0)
+        
+
+        self.Global_Cross_Attention = TransformerEncoder(
+            input_dim=input_dim,  # Directly set model_dim
+            model_dim=input_dim,  # Directly set model_dim
+            num_heads=num_heads,
+            num_layers=num_layers,
+            hidden_dim=input_dim * 2,  # This dimension can be adjusted as needed
+            dropout=dropout)
+            '''
+    def forward(self, x):
+        inputs_vis = x[0]
+        inputs_inf = x[1]
+        inputs_vis = self.ca(inputs_vis)
+        inputs_inf = self.ca(inputs_inf)
+        # Input shape is B, C, H, W
+        device = x[0].device
+        B, C, H, W = inputs_vis.shape
+
+        #NEW CONVOLUTION
+        inputs_fusion = torch.cat((inputs_vis, inputs_inf), dim=2) #B*C*2*1
+        #print(inputs_fusion.shape)
+        inputs_fusion = self.conv(inputs_fusion)
+        inputs_fusion = torch.sigmoid(inputs_fusion)
+        #print(inputs_fusion.shape)
+        #print(7)
+        #print(inputs_vis.shape)  # Debug information, can be removed
+        #print(inputs_inf.shape)
+
+
+
+        #self.Global_Cross_Attention.to(device)
+        # Reshape input to B, H*W, C
+        #visx1 = inputs_vis.permute(0, 2, 3, 1).reshape(B, -1, C)
+        #infx1 = inputs_inf.permute(0, 2, 3, 1).reshape(B, -1, C)
+        #print(visx1.shape)
+        # Input to Transformer encoder
+        #vis_outx1, inf_outx1 = self.Global_Cross_Attention(visx1, infx1)
+        #print(vis_outx1.shape)
+        # Reshape output to B, C, H, W
+        #vis_outx1 = vis_outx1.view(B, H, W, -1).permute(0, 3, 1, 2)
+        #inf_outx1 = inf_outx1.view(B, H, W, -1).permute(0, 3, 1, 2)
+
+        # Apply RELU to global information from cross-transformer, keeping only true value information
+        #vis_outx1 = torch.sigmoid(vis_outx1)
+        #vis_outx1 = F.relu(vis_outx1)
+        #inf_outx1 = torch.sigmoid(inf_outx1)
+        #inf_outx1 = F.relu(inf_outx1)
+        '''
+        
+        # Because there are cases where the product equals 0, add the two feature maps
+        B, C, H, W = inputs_vis.shape
+        B1, C1, H1, W1 = x[0].shape
+        c1=int(math.sqrt(C))
+        #print(c1)
+        inputs_vis = inputs_vis.view(B, c1, c1, 1)  # Adjust shape to B × 32 × 32 × 1
+        inputs_vis = inputs_vis.expand(-1, -1, -1, C1)  # Adjust shape to B × 32 × 32 × 32
+        inputs_vis = inputs_vis.permute(0,3,1,2)
+        vis_outx1 = vis_outx1.view(B, c1, c1, 1).expand(-1, -1, -1, C1).permute(0, 3, 1, 2)  # Adjust shape to B × 32 × 32 × 1
+        inputs_inf = inputs_inf.view(B, c1, c1, 1).expand(-1, -1, -1, C1).permute(0, 3, 1, 2)  # Adjust shape to B × 32 × 32 × 1
+        inf_outx1 = inf_outx1.view(B, c1, c1, 1).expand(-1, -1, -1, C1).permute(0, 3, 1, 2)
+        #print(vis_outx1.shape)
+        #print(inputs_vis.shape)
+        '''
+        #x[0] = x[0] * inputs_vis
+        x[0] = x[0] * inputs_fusion
+        # Experiment 1: Try simple weighting first, update:
+        #x[1] = x[1] * inputs_inf
+        x[1] = x[1] * inputs_fusion
+        # Single-dimensional attention calculation unaffected by interactive information
+        out1 = torch.cat((x[0], x[1]), dim=1)
+        #x_init = self.dconv5_5(out1)
+        #x_1 = self.dconv1_7(x_init)
+        #x_1 = self.dconv7_1(x_1)
+        #x_2 = self.dconv1_11(x_init)
+        #x_2 = self.dconv11_1(x_2)
+        #x_3 = self.dconv1_21(x_init)
+        #x_3 = self.dconv21_1(x_3)
+        #x = x_1 + x_2 + x_3 + x_init
+        #spatial_att = self.conv1(x)
+        #out = spatial_att * out1
+
+        return out1
+
+
+##################################Transformer############################################
+# Multi-head cross attention mechanism
+class MultiHeadCrossAttention(nn.Module):
+    def __init__(self, model_dim, num_heads):
+        super(MultiHeadCrossAttention, self).__init__()
+        self.num_heads = num_heads
+        self.head_dim = model_dim // num_heads
+        assert (self.head_dim * num_heads == model_dim), "model_dim must be divisible by num_heads"
+
+        self.query_vis = nn.Linear(model_dim, model_dim)
+        self.key_vis = nn.Linear(model_dim, model_dim)
+        self.value_vis = nn.Linear(model_dim, model_dim)
+
+        self.query_inf = nn.Linear(model_dim, model_dim)
+        self.key_inf = nn.Linear(model_dim, model_dim)
+        self.value_inf = nn.Linear(model_dim, model_dim)
+
+        self.fc_out_vis = nn.Linear(model_dim, model_dim)
+        self.fc_out_inf = nn.Linear(model_dim, model_dim)
+
+    def forward(self, vis, inf):
+        batch_size, seq_length, model_dim = vis.shape
+
+        # vis -> Q, K, V
+        Q_vis = self.query_vis(vis)
+        K_vis = self.key_vis(vis)
+        V_vis = self.value_vis(vis)
+
+        # inf -> Q, K, V
+        Q_inf = self.query_inf(inf)
+        K_inf = self.key_inf(inf)
+        V_inf = self.value_inf(inf)
+
+        # Reshape for multi-head attention
+        Q_vis = Q_vis.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1,
+                                                                                            2)  # B, N, C --> B, n_h, N, d_h
+        K_vis = K_vis.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        V_vis = V_vis.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+
+        Q_inf = Q_inf.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        K_inf = K_inf.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        V_inf = V_inf.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Cross attention: vis Q with inf K and inf Q with vis K
+        # Q_vis shape is (batch_size, num_heads, seq_length, head_dim)
+        # K_inf shape is (batch_size, num_heads, head_dim, seq_length)
+        # After matrix multiplication, scores_vis_inf shape is (batch_size, num_heads, seq_length, seq_length)
+        scores_vis_inf = torch.matmul(Q_vis, K_inf.transpose(-1, -2)) / torch.sqrt(
+            torch.tensor(self.head_dim, dtype=torch.float32))
+        scores_inf_vis = torch.matmul(Q_inf, K_vis.transpose(-1, -2)) / torch.sqrt(
+            torch.tensor(self.head_dim, dtype=torch.float32))
+
+        attention_inf = torch.softmax(scores_vis_inf, dim=-1)
+        attention_vis = torch.softmax(scores_inf_vis, dim=-1)
+
+        # attention_vis_inf shape is (batch_size, num_heads, seq_length, seq_length)
+        # V_inf shape is (batch_size, num_heads, seq_length, head_dim)
+        # out_vis_inf shape is (batch_size, num_heads, seq_length, head_dim)
+        out_inf = torch.matmul(attention_inf, V_inf)
+        out_vis = torch.matmul(attention_vis, V_vis)
+
+        # Concatenate and project back to the original dimension
+        out_vis = out_vis.transpose(1, 2).contiguous().view(batch_size, seq_length, model_dim)
+        out_inf = out_inf.transpose(1, 2).contiguous().view(batch_size, seq_length, model_dim)
+
+        # out shape is (batch_size, seq_length, model_dim)
+        out_vis = self.fc_out_vis(out_vis)
+        out_inf = self.fc_out_inf(out_inf)
+
+        return out_vis, out_inf
+
+
+# Feed-forward network
+class FeedForward(nn.Module):
+    def __init__(self, model_dim, hidden_dim, dropout=0.1):
+        super(FeedForward, self).__init__()
+        self.fc1 = nn.Linear(model_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, model_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
+'''
+class PEG(nn.Module):
+    def __init__(self, model_dim, k=3, multi_scale=True):
+        super(PEG, self).__init__()
+        self.multi_scale = multi_scale
+        self.proj_3 = nn.Conv2d(model_dim, model_dim, (3,1), 1, (1,0), groups=model_dim)
+        self.proj_5 = nn.Conv2d(model_dim, model_dim, (5,1), 1, (2,0), groups=model_dim)
+        self.proj_7 = nn.Conv2d(model_dim, model_dim, (7,1), 1, (3,0), groups=model_dim)
+        # Add different scale convolution kernels
+
+    def forward(self, x):
+        B, N, C = x.shape
+        #print(x.shape)
+        feat_token = x
+        #print(feat_token.shape)
+        #print(cls_token.shape)
+        H = N  # Assume H*W spatial size is approximately equal to seq_length
+        W = 1
+        cnn_feat = feat_token.transpose(1, 2)
+        #print(cnn_feat.shape)
+        cnn_feat = cnn_feat.view(B, C, H, W)
+        #print(cnn_feat.shape)
+        # Process different convolutions based on whether multi-scale is enabled
+        if self.multi_scale:
+            pe_3 = self.proj_3(cnn_feat)
+            pe_5 = self.proj_5(cnn_feat)
+            pe_7 = self.proj_7(cnn_feat)
+            #print(pe_3.shape)
+            #print(pe_5.shape)
+            x = 0.25*pe_3 + 0.25*pe_5 + 0.25*pe_7 + 0.25*cnn_feat
+        else:
+            x = self.proj_3(cnn_feat)*0.5 + cnn_feat*0.5
+
+        x = x.flatten(2).transpose(1, 2)
+        #print(x.shape)
+
+        #print(cls_token.shape)
+
+        #print(x.shape)
+        return x
+'''
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, model_dim, dropout, max_len=6400,kernel_size=3, padding=1):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+
+        # PEG part
+        #self.peg = PEG(model_dim=model_dim)
+
+
+        # Create a column vector from 0 to max_len-1, shape is (max_len, 1)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        # Calculate the divisor term for positional encoding
+        div_term = torch.exp(torch.arange(0, model_dim, 2) * -(torch.log(torch.tensor(10000.0)) / model_dim))
+
+        pe = torch.zeros(max_len, model_dim)  # Initialize positional encoding matrix, shape (max_len, model_dim), all elements initialized to 0
+        pe[:, 0::2] = torch.sin(position * div_term)  # Even columns use sin function
+        pe[:, 1::2] = torch.cos(position * div_term)  # Odd columns use cos function
+
+        pe = pe.unsqueeze(0)  # Add a new dimension before the first dimension of the positional encoding matrix, becomes (1, max_len, model_dim)
+        self.register_buffer('pe', pe)  # Register the positional encoding matrix pe as a buffer of the model. Buffer is similar to model parameters but is not updated during training
+
+    def forward(self, x):
+        # x shape is (batch_size, seq_length, model_dim)
+        # Select the first seq_len positions from the positional encoding matrix, shape (1, seq_len, model_dim)
+        # Add it to the input tensor x
+        pe = self.pe[:, :x.size(1), :]  # Select the first seq_len positions from the positional encoding matrix
+        #if x.size(1) > 1:
+        #    x_with_peg = self.peg(x)  # PEG generates positional encoding feature map
+        #    x = x + x_with_peg  # Combine absolute and relative positional encoding
+        x = x + pe
+
+        return self.dropout(x)
+# Encoder layer
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, model_dim, num_heads, hidden_dim, dropout=0.1):
+        super(TransformerEncoderLayer, self).__init__()
+        self.cross_attention = MultiHeadCrossAttention(model_dim, num_heads)
+        self.norm1 = nn.LayerNorm(model_dim)
+        self.ff = FeedForward(model_dim, hidden_dim, dropout)
+        self.norm2 = nn.LayerNorm(model_dim)
+
+    def forward(self, vis, inf):
+        attn_out_vis, attn_out_inf = self.cross_attention(vis, inf)
+        vis = self.norm1(vis + attn_out_vis)
+        inf = self.norm1(inf + attn_out_inf)
+
+        ff_out_vis = self.ff(vis)
+        ff_out_inf = self.ff(inf)
+
+        vis = self.norm2(vis + ff_out_vis)
+        inf = self.norm2(inf + ff_out_inf)
+
+        return vis, inf
+
+
+# Transformer encoder
+class TransformerEncoder(nn.Module):
+    def __init__(self, input_dim, model_dim, num_heads, num_layers, hidden_dim, dropout=0.1):
+        super(TransformerEncoder, self).__init__()
+        self.embedding = nn.Linear(input_dim, model_dim)
+        self.positional_encoding = PositionalEncoding(model_dim, dropout)
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayer(model_dim, num_heads, hidden_dim, dropout) for _ in range(num_layers)
+        ])
+
+    def forward(self, vis, inf):
+
+        vis = self.embedding(vis) * torch.sqrt(torch.tensor(self.embedding.out_features, dtype=torch.float32))
+        inf = self.embedding(inf) * torch.sqrt(torch.tensor(self.embedding.out_features, dtype=torch.float32))
+
+        vis = self.positional_encoding(vis)
+        inf = self.positional_encoding(inf)
+
+        for layer in self.layers:
+            vis, inf = layer(vis, inf)
+
+        return vis, inf
+
+
+# Define network for cross attention
+class CrossTransformerFusion(nn.Module):
+    def __init__(self, input_dim, num_heads=2, num_layers=1, dropout=0.1):
+        super(CrossTransformerFusion, self).__init__()
+        self.hidden_dim = input_dim * 2
+        self.model_dim = input_dim
+        self.encoder = TransformerEncoder(input_dim, self.model_dim, num_heads, num_layers, self.hidden_dim, dropout)
+
+        # Modified to 1x1 convolution
+        self.gate_conv = nn.Sequential(
+            nn.Conv2d(2 * input_dim, 1, kernel_size=1),  # 1x1 convolution
+            nn.Sigmoid())  # Generate 0-1 weights
+
+    def forward(self, x):
+        vis, inf = x[0], x[1]
+
+        # Input shape is B, C, H, W
+        B, C, H, W = vis.shape
+
+        #print(vis.shape)
+        # Reshape input to B, H*W, C
+        vis = vis.permute(0, 2, 3, 1).reshape(B, -1, C)
+        inf = inf.permute(0, 2, 3, 1).reshape(B, -1, C)
+
+        #print(vis.shape)
+        #print(inf.shape)
+        # Input to Transformer encoder
+        vis_out, inf_out = self.encoder(vis, inf)
+
+        # Reshape output to B, C, H, W
+        vis_out = vis_out.view(B, H, W, -1).permute(0, 3, 1, 2)
+        inf_out = inf_out.view(B, H, W, -1).permute(0, 3, 1, 2)
+
+        # Concatenate in channel dimension
+        fused_features = torch.cat([vis_out, inf_out], dim=1)  # [B, 2C, H, W]
+        gate_weights = self.gate_conv(fused_features)  # [B, 2C, H, W]
+        out = gate_weights * fused_features + fused_features
+
+        return out
+
+
+##########################################Base############################################
+class IN(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return x
+
+
+class Multiin(nn.Module):  # stereo attention block
+    def __init__(self, out=1):
+        super().__init__()
+        self.out = out
+
+    def forward(self, x):
+        channels = x.size(1)
+
+        # Divide channels in half
+        split_channels = channels // 2
+
+
+
+        # Separate visible and infrared light features
+        x1 = x[:, :split_channels, :, :]  # Visible light modality
+        x2 = x[:, split_channels:, :, :]  # Infrared light modality
+        if self.out == 1:
+            x = x1
+        else:
+            x = x2
+        #print(x.shape)
+        return x
+
+
+class SE_Block(nn.Module):
+    def __init__(self, ch_in, reduction=16):
+        super(SE_Block, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(ch_in, ch_in // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(ch_in // reduction, ch_in, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+class EFBlock(nn.Module):
+    def __init__(self, c1, c2, reduction=16):
+        super(EFBlock, self).__init__()
+        self.mask_map_r = nn.Conv2d(c1 // 2, 1, 1, 1, 0, bias=True)
+        self.mask_map_i = nn.Conv2d(c1 // 2, 1, 1, 1, 0, bias=True)
+        self.softmax = nn.Softmax(-1)
+        self.bottleneck1 = nn.Conv2d(c1 // 2, c2//2, 3, 1, 1, bias=False)
+        self.bottleneck2 = nn.Conv2d(c1 // 2, c2//2, 3, 1, 1, bias=False)
+        self.se = SE_Block(c2, reduction)
+        self.downsample = nn.Conv2d(c2,3,3,1,1,bias=True)
+
+    def forward(self, x):
+        x_left_ori, x_right_ori = x[:, :3, :, :], x[:, 3:, :, :]
+        x_left = x_left_ori * 0.5
+        x_right = x_right_ori * 0.5
+
+        x_mask_left = torch.mul(self.mask_map_r(x_left), x_left)
+        x_mask_right = torch.mul(self.mask_map_i(x_right), x_right)
+        #print(x_mask_left.shape)
+        out_IR = self.bottleneck1(x_mask_right + x_right_ori)
+        out_RGB = self.bottleneck2(x_mask_left + x_left_ori)  # RGB
+        #print(out_IR.shape)
+        out = self.se(torch.cat([out_RGB, out_IR], 1))
+        out = self.downsample(out)
+        #print(out.shape)
+        return out
+
+
+######################################CVCI##############################################
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_features, hidden_features, 1, 1, 0, bias=True),
+            nn.GELU(),
+            nn.BatchNorm2d(hidden_features, eps=1e-5),
+        )
+        self.proj = nn.Conv2d(hidden_features, hidden_features, 3, 1, 1, groups=hidden_features)
+        self.proj_act = nn.GELU()
+        self.proj_bn = nn.BatchNorm2d(hidden_features, eps=1e-5)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(hidden_features, out_features, 1, 1, 0, bias=True),
+            nn.BatchNorm2d(out_features, eps=1e-5),
+        )
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        x = x.permute(0, 2, 1).reshape(B, C, H, W)
+        x = self.conv1(x)
+        x = self.drop(x)
+        x = self.proj(x) + x
+        x = self.proj_act(x)
+        x = self.proj_bn(x)
+        x = self.conv2(x)
+        x = x.flatten(2).permute(0, 2, 1)
+        x = self.drop(x)
+        return x
+
+
+class Cross_Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None,
+                 attn_drop=0., proj_drop=0., qk_ratio=1, sr_ratio=1):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+        self.qk_dim = dim // qk_ratio
+
+        self.q = nn.Linear(dim, self.qk_dim, bias=qkv_bias)
+        self.k = nn.Linear(dim, self.qk_dim, bias=qkv_bias)
+        self.v = nn.Linear(dim, dim, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.sr_ratio = sr_ratio
+        # Exactly same as PVTv1
+        if self.sr_ratio > 1:
+            self.sr = nn.Sequential(
+                nn.Conv2d(dim, dim, kernel_size=sr_ratio, stride=sr_ratio, groups=dim, bias=True),
+                nn.BatchNorm2d(dim, eps=1e-5),
+            )
+
+    def forward(self, x, y, H, W):
+        B, N, C = x.shape
+        q = self.q(x).reshape(B, N, self.num_heads, self.qk_dim // self.num_heads).permute(0, 2, 1, 3)
+
+        if self.sr_ratio > 1:
+            y_ = y.permute(0, 2, 1).reshape(B, C, H, W)
+            y_ = self.sr(y_).reshape(B, C, -1).permute(0, 2, 1)
+
+            k = self.k(y_).reshape(B, -1, self.num_heads, self.qk_dim // self.num_heads).permute(0, 2, 1, 3)
+            v = self.v(y_).reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        else:
+            k = self.k(y).reshape(B, N, self.num_heads, self.qk_dim // self.num_heads).permute(0, 2, 1, 3)
+            v = self.v(y).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        # print(q.shape, k.shape, v.shape)
+
+        # attn = (q @ k.transpose(-2, -1)) * self.scale + relative_pos
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        # print(attn.shape)
+
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class CDAM_Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, qk_ratio=1, sr_ratio=1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        # self.norm1 = norm_layer(dim)
+        self.attn = Cross_Attention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
+            attn_drop=attn_drop, proj_drop=drop, qk_ratio=qk_ratio, sr_ratio=sr_ratio)
+        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = nn.LayerNorm(dim)
+        # self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.proj = nn.Conv2d(dim, dim, 3, 1, 1, groups=dim)
+
+    def forward(self, x, y, H, W):
+        B, N, C = x.shape
+        cnn_feat = x.permute(0, 2, 1).reshape(B, C, H, W)
+        x = self.proj(cnn_feat) + cnn_feat
+        x = x.flatten(2).permute(0, 2, 1)
+        # x = x + self.drop_path(self.attn(self.norm1(x), self.norm1(y), H, W, relative_pos))
+        x = x + self.drop_path(self.attn(self.norm1(x), self.norm1(y), H, W))
+
+        x = x + self.drop_path(self.mlp(self.norm2(x), H, W))
+        return x
+
+
+class PatchEmbed(nn.Module):
+    """ Image to Patch Embedding
+    """
+
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
+        super().__init__()
+        # img_size = img_size // 2.5
+        img_size = to_2tuple(int(img_size))
+        patch_size = to_2tuple(patch_size)
+        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
+
+        assert img_size[0] % patch_size[0] == 0 and img_size[1] % patch_size[1] == 0, \
+            f"img_size {img_size} should be divided by patch_size {patch_size}."
+
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        # FIXME look at relaxing size constraints
+        # assert H == self.img_size[0] and W == self.img_size[1], \
+        #     f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+        x = self.proj(x).flatten(2).transpose(1, 2)
+        x = self.norm(x)
+
+        H, W = H // self.patch_size[0], W // self.patch_size[1]
+        return x, (H, W)
+
+
+class CVCI(nn.Module):
+    def __init__(self, in_chans=3, embed_dims=92, img_size=128, num_classes=1000, stem_channel=16, fc_dim=1280,
+                 num_heads=[1, 2], mlp_ratios=[3.6, 3.6], qkv_bias=True, qk_scale=None, representation_size=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0., hybrid_backbone=None, norm_layer=None,
+                 depths=[0, 1], qk_ratio=1, sr_ratios=[8, 4], dp=0.1):
+        super().__init__()
+
+        self.out_dict = {}
+
+        #################### ir transformer ####################
+        self.ir_patch_embed_b = PatchEmbed(
+            img_size=img_size, patch_size=1, in_chans=in_chans, embed_dim=embed_dims)
+
+        # self.ir_relative_pos_b = nn.Parameter(torch.randn(
+        #     num_heads[1], self.ir_patch_embed_b.num_patches,
+        #     self.ir_patch_embed_b.num_patches // sr_ratios[1] // sr_ratios[
+        #         1]))  #self.ir_patch_embed_b.num_patches//sr_ratios[1]//sr_ratios[1])
+
+        ir_dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+        ir_cur = 0
+        # self.ir_blocks_a = nn.ModuleList([
+        #     CDAM_Block(
+        #         dim=embed_dims[0], num_heads=num_heads[0], mlp_ratio=mlp_ratios[0], qkv_bias=qkv_bias,
+        #         qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=ir_dpr[ir_cur + i],
+        #         norm_layer=norm_layer, qk_ratio=qk_ratio, sr_ratio=sr_ratios[0])
+        #     for i in range(depths[0])])
+        ir_cur += depths[0]
+        self.ir_blocks_b = nn.ModuleList([
+            CDAM_Block(
+                dim=embed_dims, num_heads=num_heads[1], mlp_ratio=mlp_ratios[1], qkv_bias=qkv_bias,
+                qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=ir_dpr[ir_cur + i],
+                qk_ratio=qk_ratio, sr_ratio=sr_ratios[1])
+            for i in range(depths[1])])
+
+        #################### vis transformer ####################
+        self.vis_patch_embed_b = PatchEmbed(
+            img_size=img_size, patch_size=1, in_chans=in_chans, embed_dim=embed_dims)
+
+        # self.vis_relative_pos_b = nn.Parameter(torch.randn(
+        #     num_heads[1], self.vis_patch_embed_b.num_patches,
+        #     self.vis_patch_embed_b.num_patches // sr_ratios[1] // sr_ratios[
+        #         1]))  #self.vis_patch_embed_b.num_patches // sr_ratios[1] // sr_ratios[1]
+
+        vis_dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+        vis_cur = 0
+        # self.vis_blocks_a = nn.ModuleList([
+        #     CDAM_Block(
+        #         dim=embed_dims[0], num_heads=num_heads[0], mlp_ratio=mlp_ratios[0], qkv_bias=qkv_bias,
+        #         qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=vis_dpr[vis_cur + i],
+        #         norm_layer=norm_layer, qk_ratio=qk_ratio, sr_ratio=sr_ratios[0])
+        #     for i in range(depths[0])])
+        vis_cur += depths[0]
+        self.vis_blocks_b = nn.ModuleList([
+            CDAM_Block(
+                dim=embed_dims, num_heads=num_heads[1], mlp_ratio=mlp_ratios[1], qkv_bias=qkv_bias,
+                qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=vis_dpr[vis_cur + i],
+                qk_ratio=qk_ratio, sr_ratio=sr_ratios[1])
+            for i in range(depths[1])])
+
+    def forward(self, x):
+        x, y = x[0], x[1]
+        x, (H, W) = self.ir_patch_embed_b(x)
+        y, (H, W) = self.vis_patch_embed_b(y)
+        A = x
+        B = y
+        if self.out_dict != {}:
+            for i, blk in enumerate(self.ir_blocks_b):
+                x = blk(x, B, H, W, self.out_dict["ir_relative_pos_b"])
+        else:
+            for i, blk in enumerate(self.ir_blocks_b):
+                # x = blk(x, B, H, W, self.ir_relative_pos_b)
+                x = blk(x, B, H, W)
+
+        if self.out_dict != {}:
+            for i, blk in enumerate(self.vis_blocks_b):
+                y = blk(y, A, H, W, self.out_dict["vis_relative_pos_b"])
+        else:
+            for i, blk in enumerate(self.vis_blocks_b):
+                # y = blk(y, A, H, W, self.vis_relative_pos_b)
+                y = blk(y, A, H, W)
+
+        B, N, C = x.shape
+        x = x.permute(0, 2, 1).reshape(B, C, H, W)  # Add inter-domain fusion, can directly convolve first
+        y = y.permute(0, 2, 1).reshape(B, C, H, W)  # Add inter-domain fusion, can directly convolve first
+        out_feature = torch.cat((x, y), dim=1)
+        return out_feature
+
+
+##############################################################################################
 
 class DFL(nn.Module):
     """
@@ -435,7 +1260,7 @@ class MaxSigmoidAttnBlock(nn.Module):
 
         aw = torch.einsum("bmchw,bnmc->bmhwn", embed, guide)
         aw = aw.max(dim=-1)[0]
-        aw = aw / (self.hc**0.5)
+        aw = aw / (self.hc ** 0.5)
         aw = aw + self.bias[None, :, None, None]
         aw = aw.sigmoid() * self.scale
 
@@ -499,7 +1324,7 @@ class ImagePoolingAttn(nn.Module):
         """Executes attention mechanism on input tensor x and guide tensor."""
         bs = x[0].shape[0]
         assert len(x) == self.nf
-        num_patches = self.k**2
+        num_patches = self.k ** 2
         x = [pool(proj(x)).view(bs, -1, num_patches) for (x, proj, pool) in zip(x, self.projections, self.im_pools)]
         x = torch.cat(x, dim=-1).transpose(1, 2)
         q = self.query(text)
@@ -512,7 +1337,7 @@ class ImagePoolingAttn(nn.Module):
         v = v.reshape(bs, -1, self.nh, self.hc)
 
         aw = torch.einsum("bnmc,bkmc->bmnk", q, k)
-        aw = aw / (self.hc**0.5)
+        aw = aw / (self.hc ** 0.5)
         aw = F.softmax(aw, dim=-1)
 
         x = torch.einsum("bmnk,bkmc->bnmc", aw, v)
@@ -853,7 +1678,7 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.key_dim = int(self.head_dim * attn_ratio)
-        self.scale = self.key_dim**-0.5
+        self.scale = self.key_dim ** -0.5
         nh_kd = nh_kd = self.key_dim * num_heads
         h = dim + nh_kd * 2
         self.qkv = Conv(dim, h, 1, act=False)

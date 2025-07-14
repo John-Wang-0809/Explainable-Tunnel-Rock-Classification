@@ -53,6 +53,14 @@ from .block import (
     RepVGGDW,
     ResNetLayer,
     SCDown,
+    EFBlock,
+    Multiin,
+    IN,
+    CrossTransformerFusion,
+    CPCA,
+    FeatureAdd,
+    SoftTokenShiftBlock,
+    FECA,
 )
 from .conv import (
     CBAM,
@@ -150,4 +158,12 @@ __all__ = (
     "Attention",
     "PSA",
     "SCDown",
+    "EFBlock",
+    "Multiin",
+    "IN",
+    "CrossTransformerFusion",
+    "CPCA",
+    "FeatureAdd",
+    "SoftTokenShiftBlock",
+    "FECA",
 )
